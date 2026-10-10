@@ -6,3 +6,4 @@ chip-*.txt
 
 # Documentation NXP sous copyright (repo public)
 *.pdf
+keys-*
