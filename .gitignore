@@ -1,0 +1,8 @@
+node_modules/
+.env
+.env.*
+chip-*.txt
+.DS_Store
+
+# Documentation NXP sous copyright (repo public)
+*.pdf
