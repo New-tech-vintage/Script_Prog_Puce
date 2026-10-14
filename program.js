@@ -1,19 +1,25 @@
 const fs = require('fs');
 const path = require('path');
-const readline = require('readline');
 const crypto = require('crypto');
 const { NFC } = require('nfc-pcsc');
 const ac = require('./lib/auth-crypto');
 const sm = require('./lib/secure-messaging');
 const sdm = require('./lib/sdm-config');
 const prog = require('./lib/programmer');
+const api = require('./lib/admin-api');
+const { ask, askHidden } = require('./lib/prompt');
 
-// Programmation SUN/SDM d'une NTAG 424 DNA vierge.
-//   node program.js            → DRY-RUN (par défaut) : lit l'état, calcule et affiche le plan, N'ÉCRIT RIEN.
-//   node program.js --execute  → affiche le plan, demande "OUI", puis programme la puce.
-//   --chunk=N                  → taille max (octets) de chaque WriteData / ReadBinary (défaut 32).
+// Programmation SUN/SDM d'une NTAG 424 DNA vierge, puis liaison à un exemplaire.
+//   node program.js                  → DRY-RUN (par défaut) : lit l'état, calcule et affiche le plan, N'ÉCRIT RIEN.
+//   node program.js --execute        → connexion admin, choix item/taille/couleur, puis pour chaque puce :
+//                                      plan, "OUI", programmation, vérification, liaison (link-chip).
+//   node program.js --link-only UID  → lie une puce DÉJÀ programmée (keys-UID.json), sans lecteur.
+//   --chunk=N                        → taille max (octets) de chaque WriteData / ReadBinary (défaut 32).
+// Le sun_secret (K1), K0 et le mot de passe ne sont JAMAIS affichés : seul keys-<UID>.json les contient.
 
 const EXECUTE = process.argv.includes('--execute');
+const linkOnlyIdx = process.argv.indexOf('--link-only');
+const LINK_ONLY_UID = linkOnlyIdx >= 0 ? (process.argv[linkOnlyIdx + 1] || '').toUpperCase() : null;
 const ZERO_KEY = '00'.repeat(16);
 
 // L'ACR122U échoue sur les grosses APDU : l'URL NDEF est écrite (et relue) par fragments.
@@ -41,19 +47,23 @@ const WRITE_APDUS = {
 const ALLOWED = Object.freeze(EXECUTE ? { ...READ_APDUS, ...WRITE_APDUS } : { ...READ_APDUS });
 
 // --- K0 depuis .env --------------------------------------------------------------
-function loadK0() {
+function loadEnv() {
   try {
     process.loadEnvFile(path.join(__dirname, '.env'));
   } catch (e) {
     throw new Error(`.env illisible : ${e.message}`);
   }
+}
+
+function loadK0() {
+  loadEnv();
   const k0 = (process.env.MASTER_KEY_K0 || '').trim().toUpperCase();
   if (!/^[0-9A-F]{32}$/.test(k0)) throw new Error('MASTER_KEY_K0 absente ou invalide dans .env (32 caractères hex attendus)');
   if (k0 === ZERO_KEY) throw new Error('MASTER_KEY_K0 ne doit pas être la clé usine (zéros)');
   return k0;
 }
 
-const mask = k => `${k.slice(0, 4)}…${k.slice(-4)}`;
+const HIDDEN = '«masquée — voir keys-<UID>.json»';
 
 // --- Échanges avec la puce ---------------------------------------------------------
 const hex = b => b.toString('hex').toUpperCase();
@@ -232,26 +242,139 @@ async function verifySun(send, uid, k1, cfg) {
   return url.href;
 }
 
-function ask(question) {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise(resolve => rl.question(question, a => { rl.close(); resolve(a.trim()); }));
-}
+const keysPath = uid => path.join(__dirname, `keys-${uid}.json`);
 
 function saveKeys(uid, k0, k1, status) {
-  const file = path.join(__dirname, `keys-${uid}.json`);
+  const file = keysPath(uid);
   const content = JSON.stringify({ uid, k0, k1_sun_secret: k1, date: new Date().toISOString(), status }, null, 2) + '\n';
   fs.writeFileSync(file, content, { mode: 0o600, flag: status === 'en cours' ? 'wx' : 'w' });
   return file;
 }
 
-function printKeys(uid, k0, k1, file) {
+// Ajoute / remplace des champs du fichier de clés sans toucher aux clés ni au statut.
+function updateKeysFile(uid, patch) {
+  const file = keysPath(uid);
+  const keys = JSON.parse(fs.readFileSync(file, 'utf8'));
+  fs.writeFileSync(file, JSON.stringify({ ...keys, ...patch }, null, 2) + '\n', { mode: 0o600 });
+}
+
+// Rappel avant le point de non-retour. Les clés elles-mêmes ne sont jamais affichées.
+function printKeys(uid, file) {
   console.log('\n   ╔════════════════════════════════════════════════════════════╗');
-  console.log('   ║  🔑 CLÉS DE LA PUCE — À NOTER / CONSERVER                    ║');
+  console.log('   ║  🔑 CLÉS SAUVEGARDÉES — garde ce fichier en lieu sûr          ║');
   console.log('   ╚════════════════════════════════════════════════════════════╝');
   console.log(`     UID            : ${uid}`);
-  console.log(`     K0 (maître)    : ${k0}`);
-  console.log(`     K1 (sun_secret): ${k1}`);
+  console.log(`     K0, K1         : ${HIDDEN}`);
   console.log(`     Fichier        : ${file}\n`);
+}
+
+// --- Administration : session, choix de l'item, liaison --------------------------------
+
+async function adminLogin() {
+  const cfg = api.loadAdminConfig();
+  console.log('🔐 Connexion admin (Supabase)');
+  const email = await ask('   Email        : ');
+  const password = await askHidden('   Mot de passe : ');
+  if (!email || !password) throw new Error('email et mot de passe requis');
+  const client = api.createAdminClient(cfg);
+  const who = await api.login(client, email, password);
+  console.log(`   ✔ connecté : ${who}\n`);
+  return { client, cfg };
+}
+
+async function chooseItem(client) {
+  for (;;) {
+    const q = await ask('🔎 Nom de l\'item (une partie suffit) : ');
+    if (!q) continue;
+    const items = await api.searchItems(client, q);
+    if (!items.length) {
+      console.log('   Aucun item trouvé.\n');
+      continue;
+    }
+    items.forEach((it, i) => console.log(`   ${String(i + 1).padStart(2)}. #${it.id}  ${it.name}  (${it.status ?? '—'})`));
+    const pick = await ask('   Numéro de l\'item (Entrée = nouvelle recherche) : ');
+    const n = Number(pick);
+    if (Number.isInteger(n) && n >= 1 && n <= items.length) {
+      console.log(`   ✔ ${items[n - 1].name} (#${items[n - 1].id})\n`);
+      return items[n - 1];
+    }
+  }
+}
+
+async function chooseJob(client) {
+  const item = await chooseItem(client);
+  let size = '';
+  while (!/^[A-Z0-9]{1,6}$/.test(size)) size = (await ask('📏 Taille (S, M, L, XL…) : ')).toUpperCase();
+  const color = (await ask('🎨 Couleur (optionnel, Entrée pour ignorer) : ')) || null;
+  console.log(`\n   ➜ Puces à lier à : ${item.name} (#${item.id}), taille ${size}${color ? `, ${color}` : ''}\n`);
+  return { item, size, color };
+}
+
+// Lie une puce programmée à un exemplaire. Ne lève jamais : un échec n'annule pas la programmation.
+async function linkProgrammedChip(admin, job, uid, k1) {
+  console.log(`\n🔗 Liaison : POST ${admin.cfg.backendUrl}/api/admin/link-chip`);
+  console.log(`   ${JSON.stringify({ uid, sun_secret: '«masqué»', item_id: job.item.id, size: job.size, ...(job.color ? { color: job.color } : {}) })}`);
+  let r;
+  try {
+    const token = await api.accessToken(admin.client);
+    r = await api.linkChip({
+      backendUrl: admin.cfg.backendUrl, token,
+      uid, sunSecret: k1, itemId: job.item.id, size: job.size, color: job.color,
+    });
+  } catch (e) {
+    r = { ok: false, status: null, body: e.name === 'TimeoutError' ? 'délai dépassé (backend injoignable ?)' : e.message };
+  }
+  const shown = api.redact(r.body);
+  console.log(`   ← ${r.status ? `HTTP ${r.status}` : 'pas de réponse'} : ${typeof shown === 'string' ? shown.slice(0, 500) : JSON.stringify(shown)}`);
+
+  const ex = api.exemplaireFrom(r.body);
+  updateKeysFile(uid, {
+    link: r.ok
+      ? { ok: true, item_id: job.item.id, item_name: job.item.name, serial_number: ex.serialNumber,
+          size: ex.size ?? job.size, color: ex.color ?? job.color, date: new Date().toISOString() }
+      : { ok: false, item_id: job.item.id, size: job.size, color: job.color, http_status: r.status,
+          error: typeof shown === 'string' ? shown.slice(0, 300) : shown, date: new Date().toISOString() },
+  });
+
+  console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  if (r.ok) {
+    console.log(`✅ PUCE PROGRAMMÉE ET LIÉE — ${job.item.name} exemplaire n°${ex.serialNumber ?? '?'}, `
+      + `taille ${ex.size ?? job.size}${(ex.color ?? job.color) ? `, ${ex.color ?? job.color}` : ''}`);
+    console.log(`   UID ${uid}`);
+  } else {
+    console.log('⚠️  PUCE PROGRAMMÉE MAIS PAS LIÉE');
+    console.log(`   La puce ${uid} EST programmée et vérifiée (clés dans ${path.basename(keysPath(uid))}).`);
+    console.log('   Elle n\'est rattachée à aucun exemplaire. Ne la reprogramme pas : relance seulement la liaison :');
+    console.log(`     node program.js --link-only ${uid}`);
+    process.exitCode = 1;
+  }
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  return r.ok;
+}
+
+// Liaison seule, sans lecteur, pour une puce déjà programmée et vérifiée.
+async function linkOnly(uid) {
+  if (!/^[0-9A-F]{14}$/.test(uid)) throw new Error('usage : node program.js --link-only <UID sur 14 caractères hex>');
+  const file = keysPath(uid);
+  if (!fs.existsSync(file)) throw new Error(`${path.basename(file)} introuvable`);
+  const keys = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (keys.uid !== uid || !/^[0-9A-F]{32}$/i.test(keys.k1_sun_secret || '')) throw new Error(`${path.basename(file)} invalide`);
+  if (keys.status !== 'programmée et vérifiée') {
+    throw new Error(`${path.basename(file)} : statut « ${keys.status} » — seule une puce programmée et vérifiée peut être liée`);
+  }
+  if (keys.link?.ok) {
+    throw new Error(`puce déjà liée : ${keys.link.item_name} exemplaire n°${keys.link.serial_number} (${keys.link.date})`);
+  }
+  console.log(`🔗 Liaison seule de la puce ${uid} (aucun lecteur, aucune programmation)\n`);
+  const admin = await adminLogin();
+  try {
+    const job = await chooseJob(admin.client);
+    const ok = await ask(`Lier la puce ${uid} à ${job.item.name}, taille ${job.size} ? Tape OUI : `);
+    if (ok !== 'OUI') return console.log('⏹  Annulé.');
+    await linkProgrammedChip(admin, job, uid, keys.k1_sun_secret.toUpperCase());
+  } finally {
+    await admin.client.auth.signOut().catch(() => {});
+  }
 }
 
 // --- Déroulé principal ---------------------------------------------------------------
@@ -277,8 +400,18 @@ async function run(reader, isCardPresent) {
     uid = u.data;
     if (!/^[0-9A-F]{14}$/.test(uid)) throw new StepFailure(step, `UID de 7 octets attendu, reçu ${uid}`);
     console.log(`\n💳 UID : ${uid}\n`);
-    if (EXECUTE && fs.existsSync(path.join(__dirname, `keys-${uid}.json`))) {
-      throw new StepFailure(step, `keys-${uid}.json existe déjà : déplace-le avant de reprogrammer cette puce`);
+    // Ne jamais reprogrammer une puce qui a déjà un fichier de clés.
+    if (EXECUTE && fs.existsSync(keysPath(uid))) {
+      let hint = 'déplace-le seulement si tu es sûr que cette puce n\'a jamais été programmée';
+      try {
+        const k = JSON.parse(fs.readFileSync(keysPath(uid), 'utf8'));
+        if (k.status === 'programmée et vérifiée') {
+          hint = k.link?.ok
+            ? `puce déjà programmée ET liée (${k.link.item_name} n°${k.link.serial_number})`
+            : `puce déjà programmée mais PAS liée → node program.js --link-only ${uid}`;
+        }
+      } catch { /* fichier illisible : message générique */ }
+      throw new StepFailure(step, `keys-${uid}.json existe déjà : ${hint}`);
     }
 
     // 2) SELECT
@@ -312,8 +445,8 @@ async function run(reader, isCardPresent) {
     console.log(`   URL (modèle)     : ${cfg.url}`);
     console.log(`   Offsets          : UID ${cfg.offsets.uidOffset}, compteur ${cfg.offsets.sdmReadCtrOffset}, CMAC ${cfg.offsets.sdmMacOffset}`);
     console.log(`   File settings    : ${cfg.fileSettingsHex}`);
-    console.log(`   K0 (.env)        : ${mask(k0)}`);
-    console.log(`   K1 (sun_secret)  : ${k1}${EXECUTE ? '' : '  (jetable : dry-run)'}`);
+    console.log(`   K0 (.env)        : ${HIDDEN}`);
+    console.log(`   K1 (sun_secret)  : générée aléatoirement, ${EXECUTE ? HIDDEN : 'jetable (dry-run)'}`);
     plan.forEach((s, i) => {
       console.log(`\n   ${i + 1}. ${s.name}  [CmdCtr ${preview.cmdCtr}]`);
       console.log(`      ${s.build(preview)}`);
@@ -324,7 +457,7 @@ async function run(reader, isCardPresent) {
     if (!EXECUTE) {
       console.log('🟡 DRY-RUN terminé : AUCUNE écriture effectuée.');
       console.log('   Pour programmer réellement : node program.js --execute');
-      return;
+      return { ok: false, dryRun: true };
     }
 
     // 7) Confirmation
@@ -332,7 +465,7 @@ async function run(reader, isCardPresent) {
     const answer = await ask(`⚠️  Programmer DÉFINITIVEMENT la puce ${uid} ? Tape OUI pour continuer : `);
     if (answer !== 'OUI') {
       console.log('\n⏹  Annulé : aucune écriture effectuée.');
-      return;
+      return { ok: false, cancelled: true };
     }
     if (!isCardPresent()) throw new StepFailure(step, 'puce retirée pendant la confirmation — rien n\'a été écrit');
 
@@ -345,7 +478,7 @@ async function run(reader, isCardPresent) {
     for (const [i, s] of plan.entries()) {
       step = `${i + 1}/${plan.length} ${s.name}`;
       if (i === plan.length - 1) {
-        printKeys(uid, k0, k1, keysFile);
+        printKeys(uid, keysFile);
         console.log('   ⛔ Point de non-retour : changement de K0.\n');
       }
       await smExchange(send, session, step, s.build(session), s.responseMode);
@@ -363,12 +496,13 @@ async function run(reader, isCardPresent) {
     saveKeys(uid, k0, k1, 'programmée et vérifiée');
 
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('✅ PUCE PROGRAMMÉE');
+    console.log('✅ PUCE PROGRAMMÉE ET VÉRIFIÉE');
     console.log(`   UID            : ${uid}`);
-    console.log(`   K1 (sun_secret): ${k1}`);
-    console.log(`   URL            : ${url}`);
+    console.log(`   K1 (sun_secret): ${HIDDEN}`);
+    console.log(`   URL            : ${api.redact(url)}`);
     console.log(`   Clés           : ${keysFile}`);
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    return { ok: true, uid, k1 };
   } catch (err) {
     const where = err instanceof StepFailure ? err.step : step;
     console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
@@ -389,51 +523,87 @@ async function run(reader, isCardPresent) {
     }
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     process.exitCode = 1;
+    return { ok: false };
   }
 }
 
-// --- Lecteur -------------------------------------------------------------------------
-console.log(EXECUTE
-  ? '🔴 MODE EXECUTE — la puce sera programmée après confirmation (OUI)'
-  : '🟢 MODE DRY-RUN — lecture seule, aucune écriture possible');
-console.log(`   APDU autorisées : ${Object.values(ALLOWED).join(', ')}\n`);
+// --- Lecteur et enchaînement des puces -------------------------------------------------
 
-try {
+async function main() {
+  loadEnv(); // pour tous les modes, y compris --link-only (SUPABASE_*, BACKEND_URL)
+  if (LINK_ONLY_UID !== null) {
+    await linkOnly(LINK_ONLY_UID);
+    return process.exit();
+  }
+
+  console.log(EXECUTE
+    ? '🔴 MODE EXECUTE — chaque puce est programmée après confirmation (OUI), puis liée à un exemplaire'
+    : '🟢 MODE DRY-RUN — lecture seule, aucune écriture possible');
+  console.log(`   APDU autorisées : ${Object.values(ALLOWED).join(', ')}\n`);
+
   loadK0();
-} catch (e) {
-  console.error(`❌ ${e.message}`);
-  process.exit(1);
-}
-if (EXECUTE && !process.stdin.isTTY) {
-  console.error('❌ --execute exige un terminal interactif (confirmation OUI).');
-  process.exit(1);
-}
+  if (EXECUTE && !process.stdin.isTTY) throw new Error('--execute exige un terminal interactif (confirmation OUI).');
 
-const nfc = new NFC();
-let busy = false;
+  // Session admin et exemplaire cible : une seule fois, AVANT de toucher une puce.
+  let admin = null;
+  let job = null;
+  if (EXECUTE) {
+    admin = await adminLogin();
+    job = await chooseJob(admin.client);
+  }
 
-nfc.on('reader', reader => {
-  reader.autoProcessing = false;
-  let present = false;
-  console.log(`✅ Lecteur : ${reader.reader.name}`);
-  console.log('👉 Pose UNE puce vierge et laisse-la en place jusqu\'à la fin...\n');
-
-  reader.on('card', async () => {
-    present = true;
-    if (busy) return;
-    busy = true;
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    await sleep(CARD_SETTLE_MS); // laisse le lecteur finir l'activation de la carte
-    await run(reader, () => present);
-    // Une seule puce par lancement.
+  const finish = async () => {
+    if (admin) await admin.client.auth.signOut().catch(() => {});
     process.exit();
+  };
+
+  const nfc = new NFC();
+  let busy = false;
+  let cardGen = 0; // incrémenté à chaque pose de puce
+
+  nfc.on('reader', reader => {
+    reader.autoProcessing = false;
+    let present = false;
+    console.log(`✅ Lecteur : ${reader.reader.name}`);
+    console.log('👉 Pose UNE puce vierge et laisse-la en place jusqu\'à la fin...\n');
+
+    const handleCard = async () => {
+      busy = true;
+      const gen = cardGen;
+      console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      await sleep(CARD_SETTLE_MS); // laisse le lecteur finir l'activation de la carte
+      const result = await run(reader, () => present);
+
+      // La liaison n'a lieu qu'après une programmation ENTIÈREMENT réussie (CMAC et K0 vérifiés).
+      if (result.ok) await linkProgrammedChip(admin, job, result.uid, result.k1);
+
+      if (!EXECUTE) return finish(); // dry-run : une seule puce
+
+      const next = (await ask('\n➕ Autre puce ? [Entrée] même item/taille · [n] nouvel item · [q] quitter : ')).toLowerCase();
+      if (next === 'q') return finish();
+      if (next === 'n') job = await chooseJob(admin.client);
+      console.log(`👉 Retire la puce ${result.uid || ''} et pose la suivante (${job.item.name}, ${job.size})...\n`);
+      busy = false;
+      // Une nouvelle puce posée pendant les questions : on la traite tout de suite.
+      if (present && cardGen !== gen) handleCard();
+    };
+
+    reader.on('card', () => {
+      present = true;
+      cardGen += 1;
+      if (!busy) handleCard();
+    });
+    reader.on('card.off', () => {
+      present = false;
+      console.log('   (puce retirée)');
+    });
+    reader.on('error', err => console.error(`⚠️ Erreur lecteur : ${err.message}`));
   });
 
-  reader.on('card.off', () => {
-    present = false;
-    console.log('   (puce retirée)');
-  });
-  reader.on('error', err => console.error(`⚠️ Erreur lecteur : ${err.message}`));
+  nfc.on('error', err => console.error(`⚠️ Erreur NFC : ${err.message}`));
+}
+
+main().catch(err => {
+  console.error(`\n❌ ${err.message}`);
+  process.exit(1);
 });
-
-nfc.on('error', err => console.error(`⚠️ Erreur NFC : ${err.message}`));
